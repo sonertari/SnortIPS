@@ -1,0 +1,913 @@
+#!/usr/bin/perl -T
+
+# Copyright (c) 2008-2017 Soner Tari.  All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+# 3. All advertising materials mentioning features or use of this
+#    software must display the following acknowledgement: This
+#    product includes software developed by Soner Tari
+#    and its contributors.
+# 4. Neither the name of Soner Tari nor the names of
+#    its contributors may be used to endorse or promote products
+#    derived from this software without specific prior written
+#    permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Copyright (c) 2007 Jeremie Le Hen <jeremie@le-hen.org>.  All rights reserved.
+# Copyright (c) 2003, 2004, 2005
+#     Stephan Schmieder <ssc@unix-geek.info>.  All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY STEPHAN SCHMIEDER AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL STEPHAN SCHMIEDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+
+use strict;
+use warnings;
+
+use POSIX qw(setsid);
+use Fcntl qw(:seek);
+use Getopt::Std;
+use Sys::Syslog qw(:standard :macros setlogsock);
+use Net::IP;
+
+my $name	  = 'snortips';
+my $version   = '6.2';
+my $pfctl	 = '/sbin/pfctl';
+
+# <default>
+my $conffile  = "/etc/snort/$name.conf";
+my $alertfile = '/var/log/snort/alert.log';
+my $pidfile   = "/var/run/$name.pid";
+my $blockduration   = 60;
+my $maxblockduration= 3600;
+my $dumpfile  = "/var/db/$name";
+my $sigmsgfile= "/var/tmp/$name.sigmsg";
+my $andpriokey= 'yes';
+my $priority  = 1;
+# Keyword list.
+my $kl;
+my $klnum   = 0;
+# </default>
+
+# %bad_hosts keys will be both block duration ticks and hosts.  Their namespaces
+# don't overlap so this doesn't matter.
+# For each key being an block duration tick, the corresponding value is a hash
+# containing the host(s) being blocked.
+# For each key being a host, the corresponding value is its block duration tick,
+# so it can be doubled for recidivists.
+my %bad_hosts;
+
+my $initializing= 1;
+my $tick	  = 1;
+my $ALERTFILE;
+my $alertsize;
+my $re_subnet = qr/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}/o;
+my $re_ip	 = qr/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/o;
+my $re_port   = qr/\d{1,5}/o;
+
+# White list.
+my $wl;
+my $wlnum   = 0;
+# Black list.
+my $bl;			# Contains a hash ref 
+my $blnum   = 0;
+
+my $busy= 0;
+my $dumprequested= 0;
+
+sub log {
+	my ($level, $msg) = @_;
+	# Compat with older Sys::Syslog modules.
+	syslog($level, "%s", $msg);
+}
+
+sub fatal {
+	&log(@_);
+	exit 1;
+}
+
+sub hangup {
+	$busy= 1;
+	
+	my ($sig) = @_;
+
+	&log(LOG_NOTICE, "Received SIG$sig, reloading configuration...");
+	if (-f $conffile) {
+		-r $conffile or &fatal(LOG_ERR, "$conffile: Not readable");
+		&load_conf();
+		&load_whitelist();
+		&load_blacklist();
+	}
+
+	$busy= 0;
+}
+
+sub dumpinfo {
+	$dumprequested= 0;
+	if ($busy == 1) {
+		$dumprequested= 1;
+		return;
+	}
+
+	open(DumpFile, ">$dumpfile");
+
+	foreach (split(/\n/, `$pfctl -t $name -Ts`)) {
+		chomp;
+		s/^\s*//;
+
+		my $host;
+		m/^([!]*($re_ip|$re_subnet))$/ and $host= $1;
+		$host =~ m/^!.*$/ and print DumpFile "$host\n" and next;
+		if (exists $bad_hosts{$host} and $bad_hosts{$host}) {
+			my $exptime= $bad_hosts{$host} - $tick;
+			print DumpFile "$host ($exptime)\n";
+			next;
+		}
+		defined $host and print DumpFile "$host\n";
+	}
+	print DumpFile ".\n";
+	close(DumpFile);
+}
+
+sub byebye {
+	my ($sig) = @_;
+
+	&log(LOG_NOTICE, "Received SIG$sig. Exiting...");
+	unlink $pidfile;
+	exit 0;
+}
+
+
+sub usage {
+	my ($basename) = ($0 =~ m#.*([^/]*)$#);
+	print STDERR <<EOF
+Usage: $name [-hV] [-f conffile] [-a alertfile] [-p pidfile]
+	[-s block duration] [-m maxblockduration] [-d dumpfile] [-u sigmsgfile]
+Options:
+	-h	show this help message
+	-V	show version
+	-f	use configuration file
+	-a	set Snort's alert file
+	-p	set pidfile
+	-s	set block duration time
+	-m	set max block duration
+	-d	set info dump file
+	-u	set signal message file
+Defaults:
+	conffile: $conffile
+	alertfile: $alertfile
+	pidfile: $pidfile
+	block duration: $blockduration
+	maxblockduration: $maxblockduration
+	dumpfile: $dumpfile
+	sigmsgfile: $sigmsgfile
+EOF
+}
+
+# Modified SpamAssassin daemonize()
+sub daemonize {
+	# be a nice daemon and chdir to the root so we don't block any
+	# unmount attempts
+	chdir '/' or &fatal(LOG_ERR, "Cannot chdir to /: $!");
+
+	# Redirect in and out to the bit bucket
+	open STDIN,  "</dev/null" or &fatal(LOG_ERR, "Cannot read from /dev/null: $!");
+	open STDOUT, ">/dev/null" or &fatal(LOG_ERR, "Cannot write to /dev/null: $!");
+
+	# Here we go...
+	defined( my $pid = fork ) or &fatal(LOG_ERR, "Cannot fork: $!");
+	exit if $pid;
+	setsid or &fatal(LOG_ERR, "Cannot start new session: $!");
+
+	# Now we can redirect the errors, too.
+	open STDERR, '>&STDOUT' or &fatal(LOG_ERR, "Cannot duplicate stdout: $!");
+
+	&log(LOG_INFO, "Successfully daemonized");
+}
+
+sub update_bad_hosts {
+	my ($host, $exptick, $duration, $startup) = @_;
+
+	if (($startup eq 'blacklist') or (defined $bl->{$host})) {
+		$exptick= 0;
+		$duration= 0;
+	}
+
+	$bad_hosts{$host} = $exptick;
+
+	$bad_hosts{$exptick} = {} unless exists $bad_hosts{$exptick};
+	$bad_hosts{$exptick}->{$host} = $duration;
+}
+
+sub force_blacklist_host {
+	my ($host)= @_;
+
+	if (&pfctl_unblock($host)) {
+		if (&pfctl_block($host)) {
+			&log(LOG_INFO, "Forced blacklisting host $host");
+			$_[0]= $host;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+# Register or extend block duration.  Return 1 if the host has been registered, 0 if
+# its block duration has been extended.
+sub register_host {
+	my ($host, $startup, $duration) = @_;
+	my $retval= 1;
+
+	not defined $startup and $startup= 'notdefined';
+	# Values for a newly blocked host.
+	not defined $duration and $duration= $blockduration;	# Blocking duration.
+	if ($duration > $maxblockduration) {
+		$duration= $maxblockduration;
+	}
+	my $exptick = $tick + $duration;						# Blocking expiration tick.
+
+	# Host was already blocked.
+	if (($startup eq 'startup') or &is_blocked($host)) {
+		if ($startup eq 'startup') {
+			&log(LOG_INFO, "Recovering previously blocked host $host");
+		}
+
+		my $oldexptick = 0;
+		my $extendedtime= $duration;
+		if (exists $bad_hosts{$host}) {
+			$oldexptick = $bad_hosts{$host};
+			# Extend block duration.
+			$duration = $bad_hosts{$oldexptick}->{$host} + $duration;
+			if ($duration > $maxblockduration) {
+				$duration= $maxblockduration;
+				$extendedtime= 0;
+				&log(LOG_INFO, "Host $host reached max block duration $maxblockduration");
+			}
+			$exptick = $tick + $duration;
+
+			# Cleanup old expiration tick.
+			delete $bad_hosts{$oldexptick}->{$host};
+			if (($startup ne 'blacklist') and (not defined $bl->{$host})) {
+				(%{$bad_hosts{$oldexptick}} == 0) and delete $bad_hosts{$oldexptick};
+			}
+		}
+		
+		if (($startup ne 'blacklist') and (not defined $bl->{$host})) {
+			&log(LOG_INFO, "Host $host is already blocked; ".
+				"extending block duration by $extendedtime ticks");
+		}
+		else {
+			&log(LOG_INFO, "Host $host is already blocked; blocking as blacklisted");
+			if (not &pfctl_block($host)) {
+				if ($startup eq 'blacklist') {
+					# Blacklisted hosts should be added forcefully
+					if (force_blacklist_host($host)) {
+						goto ADD;
+					}
+				}
+				$retval = 0;
+				&log(LOG_WARNING, "Failed re/blocking host $host");
+				goto DONOT_ADD;
+			}
+		}
+	}
+	else {
+		if (&pfctl_block($host)) {
+			if ($startup eq 'blacklist') {
+				&log(LOG_INFO, "Blocking host $host as blacklisted");
+			}
+			else {
+				&log(LOG_INFO, "Blocking host $host for $duration ticks");
+			}
+		}
+		else {
+			if ($startup eq 'blacklist') {
+				# Blacklisted hosts should be added forcefully
+				if (force_blacklist_host($host)) {
+					goto ADD;
+				}
+			}
+			$retval = 0;
+			&log(LOG_WARNING, "Failed re/blocking host $host");
+			goto DONOT_ADD;
+		}
+	}
+
+ADD:
+	&update_bad_hosts($host, $exptick, $duration, $startup);
+
+DONOT_ADD:
+	$_[0]= $host;
+	return $retval;
+}
+
+# Calls pfctl
+#  A	The address/network has been added.
+#  C	The address/network has been changed (negated).
+#  D	The address/network has been deleted.
+#  M	The address matches (test operation only).
+#  X	The address/network is duplicated and therefore ignored.
+#  Y	The address/network cannot be added/deleted due to conflict-
+#	   ing `!' attributes.
+#  Z	The address/network has been cleared (statistics).
+# 
+# Return 1 on success, 0 on failure.
+sub call_pfctl {
+	my ($cmd, $msg, $host) = @_;
+
+	my $retval= 1;
+
+	defined $host and $cmd =~ s/<HOST>/$host/;
+	my $output= `$cmd 2>&1`;
+
+	my $result= '0';
+	$output =~ /^(\d+)\/(\d+) addresses (added|deleted)(|\s+\(dummy\))\.$/m and $result= $1;
+	$output =~ /^(\d+) addresses deleted(|\s+\(dummy\))\.$/m and $result= $1;
+
+	$output =~ /^[ACDMXYZ]\s+[!]*($re_ip|$re_subnet)\s*$/m and $host= $1;
+
+	if ($result == '0') {
+		defined $host and $msg =~ s/<HOST>/$host/;
+		&log(LOG_WARNING, "$msg, pfctl failed: (command: $cmd)");
+		$retval= 0;
+	}
+	$_[2]= $host;
+	return $retval;
+}
+
+# Check if host is already blocked.
+sub is_blocked {
+	my ($host)= @_;
+
+	my $actual= $host;
+	if (not &call_pfctl("$pfctl -n -v -t $name -T add <HOST>", "Can't test-block <HOST>", $actual)) {
+		my $output= `$pfctl -t $name -Ts`;
+		$output =~ /^\s*($host|$actual)\s*$/m and return 1;
+	}
+	$_[0]= $actual;
+	return 0;
+}
+
+# Block host.
+sub pfctl_block {
+	return &call_pfctl("$pfctl -v -t $name -T add <HOST>", "Can't block <HOST>", $_[0]);
+}
+
+# Unblock host.
+sub pfctl_unblock {
+	return &call_pfctl("$pfctl -v -t $name -T delete <HOST>", "Can't unblock <HOST>", $_[0]);
+}
+
+# Unblock all using table.
+sub pfctl_unblock_all {
+	return &call_pfctl("$pfctl -v -t $name -T flush", "Can't unblock all");
+}
+
+# Deblock host using table.
+sub pfctl_deblock {
+	return &call_pfctl("$pfctl -v -t $name -T add !<HOST>", "Can't deblock <HOST>", $_[0]);
+}
+
+# Undeblock host using table.
+sub pfctl_undeblock {
+	return &call_pfctl("$pfctl -v -t $name -T delete !<HOST>", "Can't undeblock <HOST>", $_[0]);
+}
+
+# Retrieve previously blocked host using table.
+# Return the number of retrieved hosts.
+sub pfctl_resume {
+	my $ANCHORS;
+	my $nhosts;
+
+	defined (open $ANCHORS, "$pfctl -v -t $name -T show 2>/dev/null |") or
+		&fatal(LOG_ERR, "Can't retrieve previously blocked host: $!");
+	$nhosts = 0;
+	while (my $host = <$ANCHORS>) {
+		chomp $host;
+		$host =~ s/^\s*//;
+		next unless $host =~ /^($re_ip|$re_subnet)$/ and $host= $1;
+		&register_host($host, "startup") and $nhosts++;
+	}
+	close $ANCHORS;
+	&log(LOG_NOTICE, "$nhosts hosts reloaded from table '$name'");
+
+	return $nhosts;
+}
+
+# Unblock all hosts and zero out everything.
+sub softinit {
+	$busy= 1;
+	$initializing= 1;
+	
+	&log(LOG_NOTICE, 'Soft init requested, unblocking and zeroing all');
+	&pfctl_unblock_all() or &log(LOG_INFO, "Failed unblocking all");
+	%bad_hosts= ();
+	$bl= ();
+	$wl= ();
+	$tick= 1;
+	
+	if (-f $conffile) {
+		-r $conffile or &fatal(LOG_ERR, "$conffile: Not readable");
+		&load_conf();
+		&load_whitelist();
+		&load_blacklist();
+	}
+	
+	$initializing= 0;
+	$busy= 0;
+}
+
+sub initalize {
+	my %opts;
+	my $PIDFILE;
+
+	setlogsock('unix');
+	openlog($name, 'pid,ndelay', LOG_DAEMON);
+
+	# Parse command-line.
+	# Options passed on the command line override conf file settings
+	getopts('f:a:hVp:s:m:d:u:', \%opts);
+
+	if (exists $opts{h}) {
+		&usage();
+		exit 0;
+	}
+
+	if (exists $opts{V}) {
+		print "$name-$version\n";
+		exit 0;
+	}
+
+	# Issue startup message.
+	&log(LOG_NOTICE, "Starting...");
+
+	## DAEMONIZE! ##
+	daemonize();
+	
+	$SIG{INT} = \&byebye;
+	$SIG{TERM} = \&byebye;
+	$SIG{HUP} = \&hangup;
+	$SIG{INFO} = \&dumpinfo;
+	$SIG{USR1} = \&process_sigmsg;
+	$SIG{USR2} = \&softinit;
+
+	exists $opts{f} and $conffile = $opts{f};
+	
+	if (-f $conffile) {
+		-r $conffile or &fatal(LOG_ERR, "$conffile: Not readable");
+		&load_conf();
+	}
+
+	# Check and sanitize environment.
+	delete @ENV{qw(PATH IFS CDPATH ENV)};
+	
+	exists $opts{a} and $alertfile = $opts{a};
+	-f $alertfile or &fatal(LOG_ERR, "$alertfile: No such file");
+	-r $alertfile or &fatal(LOG_ERR, "$alertfile: Not readable");
+	
+	-x $pfctl or &fatal(LOG_ERR, "$pfctl: Not executable");
+
+	if (exists $opts{s}) {
+		$opts{s} =~ m/^\d+$/ or &fatal(LOG_ERR, "$opts{s}: Not a number");
+		$blockduration = $opts{s};
+		#This line is for KDevelop perl syntax highlighter: "
+	}
+	
+	if (exists $opts{m}) {
+		$opts{m} =~ m/^\d+$/ or &fatal(LOG_ERR, "$opts{m}: Not a number");
+		$maxblockduration = $opts{m};
+	}
+	
+	exists $opts{d} and $dumpfile = $opts{d};
+	exists $opts{u} and $sigmsgfile = $opts{u};
+
+	# Handle pidfile.
+	exists $opts{p} and $pidfile = $opts{p};
+	if (-f $pidfile) {
+		defined (open $PIDFILE, '<', $pidfile) or
+			&fatal(LOG_ERR, "Can't read pidfile '$pidfile': $!");
+		my $pid = <$PIDFILE>;
+		close $PIDFILE;
+		chomp $pid;
+
+		# Untaint $pid.
+		$pid =~ m/^(\d+)$/;
+		$pid = $1;
+
+		kill (0, $pid) == 0 or
+			&fatal(LOG_ERR, "$name seems to be running as PID $pid");
+
+		unlink $pidfile;
+	}
+
+	defined (open $PIDFILE, '>', $pidfile) or
+		&fatal(LOG_ERR, "Can't write pidfile '$pidfile': $!");
+	print $PIDFILE "$$\n";
+	close $PIDFILE;
+
+	&load_whitelist();
+	&load_blacklist();
+	
+	# And finally, check for previously blocked hosts.
+	&pfctl_resume();
+	$initializing= 0;
+}
+
+sub load_conf {
+	my $LIST;
+
+	if (not defined open $LIST, '<', $conffile) {
+		&log(LOG_ERR, "Cannot open conf file '$conffile': $!");
+		return 0;
+	}
+	
+	&log(LOG_NOTICE, "Loading configuration from '$conffile'");
+
+	$kl= ();
+	while (my $line = <$LIST>) {
+		chomp $line;
+
+		#AlertFile /var/log/snort/alert.log
+		$line =~ /^AlertFile\s+(.*)$/ and $alertfile= $1;
+
+		#PidFile /var/run/snortips.pid
+		$line =~ /^PidFile\s+(.*)$/ and $pidfile= $1;
+
+		#BlockDuration 60
+		$line =~ /^BlockDuration\s+(\d+)$/ and $blockduration= $1;
+
+		#MaxBlockDuration 3600
+		$line =~ /^MaxBlockDuration\s+(\d+)$/ and $maxblockduration= $1;
+
+		#SigmsgFile /var/tmp/snortips.sigmsg
+		$line =~ /^SigmsgFile\s+(.*)$/ and $sigmsgfile= $1;
+
+		#DumpFile /var/db/snortips
+		$line =~ /^DumpFile\s+(.*)$/ and $dumpfile= $1;
+
+		#AndPrioKey yes
+		$line =~ /^AndPrioKey\s+(yes|no)$/ and $andpriokey= $1;
+
+		#Priority 4
+		$line =~ /^Priority\s+(\d+)$/ and $priority= $1;
+
+		#Keyword "Portscan"
+		#Keyword "Attempted Information Leak"
+		if ($line =~ /^Keyword\s+"(.*)"$/) {
+			$klnum++;
+			$kl->{$1}= 1;
+		}
+	}
+	
+	close $LIST;
+
+	return 1;
+}
+
+#  Flush and load whitelist.
+sub load_whitelist {
+	my $LIST;
+
+	$wlnum = 0;
+
+	if (not defined open $LIST, '<', $conffile) {
+		&log(LOG_ERR, "Cannot open whitelist '$conffile': $!");
+		return 0;
+	}
+	
+	foreach my $host (keys %$wl) {
+		next unless $host =~ m/^($re_ip|$re_subnet)$/;
+		&log(LOG_DEBUG, "White list processing $host");
+		# untaint $host
+		$host =~ /^($re_ip|$re_subnet)$/ and $host = $1;
+		&pfctl_undeblock($host) or &log(LOG_INFO, "Failed undeblocking host $host");
+	}
+
+	$wl= ();
+	&log(LOG_NOTICE, "Loading whitelist from '$conffile'");
+
+	while (my $line = <$LIST>) {
+		chomp $line;
+
+		if (not $line =~ /^!($re_ip|$re_subnet)$/) {
+			next;
+		}
+
+		# untaint $host
+		my $host;
+		$line =~ /^!($re_ip|$re_subnet)$/ and $host= $1;
+
+		if (&unblock($host, 'whitelist')) {
+			&log(LOG_INFO, "Adding $host to whitelist");
+			$wlnum++;
+			$wl->{$host}= 1;
+		}
+	}
+
+	&log(LOG_NOTICE, "Loaded $wlnum entries from whitelist");
+	close $LIST;
+
+	return 1;
+}
+
+# Flush and load blacklist.
+sub load_blacklist {
+	my $LIST;
+
+	$blnum = 0;
+
+	if (not defined open $LIST, '<', $conffile) {
+		&log(LOG_ERR, "Cannot open blacklist '$conffile': $!");
+		return 0;
+	}
+	
+	foreach my $host (keys %$bl) {
+		next unless $host =~ m/^($re_ip|$re_subnet)$/;
+		&log(LOG_DEBUG, "Black list processing $host");
+		# untaint $host
+		$host =~ /^($re_ip|$re_subnet)$/ and $host = $1;
+		# expire $host
+		&unblock($host);
+	}
+
+	$bl= ();
+	&log(LOG_NOTICE, "Loading blacklist from '$conffile'");
+
+	while (my $line = <$LIST>) {
+		chomp $line;
+
+		if (not $line =~ /^($re_ip|$re_subnet)$/) {
+			next;
+		}
+
+		# untaint $host
+		my $host;
+		$line =~ /^($re_ip|$re_subnet)$/ and $host= $1;
+
+		if (&block($host, 'blacklist')) {
+			&log(LOG_INFO, "Adding $host to blacklist");
+			$blnum++;
+			$bl->{$host}= 1;
+		}
+	}
+
+	&log(LOG_NOTICE, "Loaded $blnum entries from blacklist");
+	close $LIST;
+
+	return 1;
+}
+
+# (Re-)open the global $alertfile as $ALERTFILE.  Retry forever if needed.
+# Reset the global $alertsize variable.
+sub open_alertfile {
+
+	if (defined $ALERTFILE) {
+		close $ALERTFILE;
+		undef $ALERTFILE
+	}
+
+	while (1) {
+		defined (open $ALERTFILE, '<', $alertfile) and last;
+		print STDERR "Can't read alertfile '$alertfile': $!\n";
+		sleep 10;
+	}
+	$alertsize = 0;
+}
+
+
+# Check the line is an attack are return the offending host if any.
+sub check_for_attack {
+	my $line= $_[0];
+
+	#Jun 27 18:12:41 comixwall snort[2875]: [122:1:0] (portscan) TCP Portscan[Priority: 3]: {RESERVED} 10.0.0.11 -> 10.0.0.13
+	#Jun 27 18:12:45 comixwall snort[2875]: [116:59:1] (snort_decoder): Tcp Window Scale Option found with length > 14[Priority: 3]: {TCP} 10.0.0.11:52936 -> 10.0.0.13:25
+	my $match= 0;
+	
+	if ($line =~ /\[Priority:\s+(\d+)\]/o) {
+		if ($1 <= $priority) {
+			$match= 1;
+			&log(LOG_DEBUG, "Alert matches priority [$priority]: $1");
+		}
+	}
+	
+	# Check for keywords if priority does not match or we are to and prio and key
+	# ATTENTION: If the keyword list is empty, do not reset the $match var
+	if ($klnum > 0 and ($match == 0 or $andpriokey == 'yes')) {
+		$match= 0;
+		foreach my $keyword (keys %$kl) {
+			$keyword =~ s/\//\\\//;
+			if ($line =~ /$keyword/) {
+				$match= 1;
+				&log(LOG_DEBUG, "Alert matches keyword: $keyword");
+				last;
+			}
+		}
+	}
+	
+	if ($match == 1) {
+		if ($line =~ /($re_ip)(\:$re_port|) -> $re_ip(\:$re_port|)/o) {
+			return $1;
+		}
+	}
+
+	return 0;
+}
+
+# Block host.
+sub block {
+	my ($host, $list, $duration)= @_;
+	my $retval= 1;
+
+	if ($list ne 'blacklist' and $list ne 'sigmsg') {
+		my $ip = new Net::IP ($host);
+		my $wl_ip = new Net::IP ($host);
+		foreach my $list_ip (keys %$wl) {
+			next unless $list_ip =~ m/^($re_ip|$re_subnet)$/;
+			$wl_ip->set($list_ip);
+			if (($wl_ip->overlaps($ip) == $IP_B_IN_A_OVERLAP)
+				or ($wl_ip->overlaps($ip) == $IP_IDENTICAL)) {
+				&log(LOG_NOTICE, "Can't block, $host whitelisted");
+				$retval= 0;
+				goto EXIT_BLOCK;
+			}
+		}
+	}
+
+	if ($retval= &register_host($host, $list, $duration)) {
+		if (system("$pfctl -k $host >/dev/null 2>&1")) {
+			&log(LOG_WARNING, "Can't kill states for $host: $!");
+			$retval= 0;
+		}
+	}
+
+EXIT_BLOCK:
+	$_[0]= $host;
+	return $retval;
+}
+
+
+# Blocks or Unblocks IPs given in sigmsg file
+# Called upon USR1 signal
+sub process_sigmsg {
+	$busy= 1;
+	
+	my $LIST;
+	my $cmd;
+	my $duration;
+	my $host;
+
+	not -f $sigmsgfile and return;
+
+	if (not defined open $LIST, '<', $sigmsgfile) {
+		&log(LOG_ERR, "Cannot open '$sigmsgfile': $!");
+		return 0;
+	}
+
+	while (my $line = <$LIST>) {
+		chomp $line;
+
+		# untaint $host
+		$cmd= 'undefined';
+		$line =~ /^(U|B)\s+($re_ip|$re_subnet)\s*$/ and $cmd= $1 and $host = $2;
+		$line =~ /^(B)\s+($re_ip|$re_subnet)\s+(\d+)$/ and $cmd= $1 and $host = $2 and $duration= $3;
+
+		if (not $host =~ /^($re_ip|$re_subnet)$/) {
+			&log(LOG_WARNING, "Skipping invalid entry $host");
+			next;
+		}
+		
+		my $logaction= 'Failed action on';
+		($cmd eq 'U') and &unblock($host) and $logaction= 'Unblocked';
+		($cmd eq 'B') and &block($host, 'sigmsg', $duration) and $logaction= 'Blocked';
+		&log(LOG_INFO, "$logaction host $host");
+	}
+
+	close $LIST;
+	unlink $sigmsgfile;
+	
+	$busy= 0;
+}
+
+# Unblock host if not blacklisted.
+sub unblock {
+	my ($host, $listname)= @_;
+
+	my $retval= 1;
+
+	not defined $listname and $listname= 'undefined';
+
+	if (&pfctl_unblock($host) or ($listname eq 'whitelist') or $initializing) {
+		&log(LOG_INFO, "Unblocking host $host");
+		if ($listname eq 'whitelist') {
+			if (not &pfctl_deblock($host) and not $initializing) {
+				&log(LOG_INFO, "Failed deblocking host $host");
+				$retval= 0;
+				goto EXIT_UNBLOCK;
+			}
+			&log(LOG_INFO, "Deblocked host $host");
+		}
+		delete $bad_hosts{$host};
+		# TODO: Should delete from the tick array element too, but too difficult
+		# see unblock_expired(), it will handle this case fine
+	}
+	else {
+		&log(LOG_INFO, "Failed unblocking host $host");
+		$retval= 0;
+	}
+
+EXIT_UNBLOCK:
+	$_[0]= $host;
+	return $retval;
+}
+
+# Unblock all host for which we have reached the expiration tick.
+sub unblock_expired {
+	my $hosts;
+
+	return if not exists $bad_hosts{$tick};
+
+	$hosts = $bad_hosts{$tick};
+	delete $bad_hosts{$tick};
+
+	foreach my $h (keys %$hosts) {
+		# Might have lost sync with bad_hosts hosts list, check first:
+		&unblock($h) if exists $bad_hosts{$h};
+	}
+}
+
+
+&initalize();
+&open_alertfile();
+seek $ALERTFILE, 0, SEEK_END;		# Won't fail.
+$alertsize = tell $ALERTFILE;		# Idem.
+
+my @stat = stat $alertfile;
+my $alertinode= $stat[1];
+
+while (1) {
+	# unblock old hosts
+	&unblock_expired();
+
+	if ($dumprequested) {
+		&dumpinfo();
+	}
+
+	while (my $line = <$ALERTFILE>) {
+		chomp $line;
+		my $host;
+
+		$host = &check_for_attack($line);
+		if ($host) {
+			&block($host, 'dummy');
+			next;
+		}
+		# Junk line.
+	}
+
+	@stat = stat $alertfile;
+	if (@stat != 0 && $stat[1] != $alertinode) {
+		# File inode changed, assume rotation; reopen and process
+		&log(LOG_INFO, "Alert file inode changed, reopening...");
+		&open_alertfile();
+		$alertinode= $stat[1];
+		next;
+	}
+
+	seek $ALERTFILE, 0, SEEK_CUR;	# Reset EOF.  Won't fail.
+	$tick++;
+	sleep 1;
+}
