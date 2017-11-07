@@ -360,7 +360,7 @@ sub call_pfctl {
 
 	$output =~ /^[ACDMXYZ]\s+[!]*($re_ip|$re_subnet)\s*$/m and $host= $1;
 
-	if ($result == '0') {
+	if ($result eq '0') {
 		defined $host and $msg =~ s/<HOST>/$host/;
 		&log(LOG_WARNING, "$msg, pfctl failed: (command: $cmd)");
 		$retval= 0;
@@ -715,32 +715,33 @@ sub check_for_attack {
 
 	#Jun 27 18:12:41 comixwall snort[2875]: [122:1:0] (portscan) TCP Portscan[Priority: 3]: {RESERVED} 10.0.0.11 -> 10.0.0.13
 	#Jun 27 18:12:45 comixwall snort[2875]: [116:59:1] (snort_decoder): Tcp Window Scale Option found with length > 14[Priority: 3]: {TCP} 10.0.0.11:52936 -> 10.0.0.13:25
-	my $match= 0;
+	my $match_prio= 0;
+	my $match_key= 0;
 	
 	if ($line =~ /\[Priority:\s+(\d+)\]/o) {
 		if ($1 <= $priority) {
-			$match= 1;
+			$match_prio= 1;
 			&log(LOG_DEBUG, "Alert matches priority [$priority]: $1");
 		}
 	}
-	
-	# Check for keywords if priority does not match or we are to and prio and key
-	# ATTENTION: If the keyword list is empty, do not reset the $match var
-	if ($klnum > 0 and ($match == 0 or $andpriokey == 'yes')) {
-		$match= 0;
+
+	# Check for keywords if (1) priority does not match and we are to OR prio and key, or (2) we are to AND prio and key
+	if ($klnum > 0 and ($match_prio == 0 or $andpriokey eq 'yes')) {
 		foreach my $keyword (keys %$kl) {
 			$keyword =~ s/\//\\\//;
 			if ($line =~ /$keyword/) {
-				$match= 1;
+				$match_key= 1;
 				&log(LOG_DEBUG, "Alert matches keyword: $keyword");
 				last;
 			}
 		}
 	}
-	
-	if ($match == 1) {
-		if ($line =~ /($re_ip)(\:$re_port|) -> $re_ip(\:$re_port|)/o) {
-			return $1;
+
+	if ($match_prio == 1 or $match_key == 1) {
+		if ($andpriokey eq 'no' or ($match_prio == 1 and $match_key == 1)) {
+			if ($line =~ /($re_ip)(\:$re_port|) -> $re_ip(\:$re_port|)/o) {
+				return $1;
+			}
 		}
 	}
 
