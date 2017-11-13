@@ -4,14 +4,14 @@ SnortIPS is a passive Intrusion Prevention System (IPS) for Snort IDS running on
 
 ## Features
 
-This is the summary of how SnortIPS operates:
+As a summary of its operation, SnortIPS:
 
-- SnortIPS follows Snort alerts file to find in each alert the priority and keywords defined in its configuration file.
-- When it finds a matching alert, the IP address in the alert is blocked for a duration of time. SnortIPS adds such hosts to a snortips table in pf.
-- SnortIPS relies on pfctl while managing its hosts table, and is able to recover previously blocked hosts when starting.
-- The hosts table supports white and black list entries.
-- Upon receiving the INFO signal, SnortIPS dumps currently blocked, whitelisted, and blacklisted hosts with the total numbers of each to a dump file.
-- Upon receiving the USR1 signal, SnortIPS processes commands in the signal message file.
-- Upon receiving the USR2 signal, SnortIPS unblocks all non-blacklisted hosts and zeros all variables.
-- SnortIPS reloads its configuration upon receiving the HUP signal.
-- SnortIPS handles alert file rotation.
+- Follows new lines appended to Snort alerts file to find priority and keywords defined in its configuration file.
+- Blocks source IP addresses in matching alerts for a duration of time.
+- Adds such hosts to snortips table defined in pf.conf, which supports white and black list entries as well.
+- Relies on pfctl while managing this hosts table, and is able to recover previously blocked hosts when starting.
+- Upon receiving the INFO signal, dumps currently blocked, whitelisted, and blacklisted hosts with the total numbers of each to a dump file.
+- Upon receiving the USR1 signal, processes commands in the signal message file.
+- Upon receiving the USR2 signal, unblocks all non-blacklisted hosts and zeros all variables.
+- Upon receiving the HUP signal, reloads its configuration.
+- Handles alert file rotation.
